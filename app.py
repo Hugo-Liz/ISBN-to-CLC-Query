@@ -6,7 +6,7 @@ import io
 import time
 import json
 import traceback
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify, send_file, Response, stream_with_context
 import pandas as pd
 
 from isbn_utils import validate_isbn
@@ -127,24 +127,46 @@ def api_batch():
                 "error": f"单次最多查询 30 条，当前文件包含 {len(isbn_list)} 条"
             }), 400
 
-        # 逐条查询，加入请求间隔
-        results = []
-        for i, isbn_raw in enumerate(isbn_list):
-            result = _do_query(isbn_raw)
-            results.append(result)
-            # 请求间隔：避免触发国图反爬，每次间隔 3-5 秒
-            if i < len(isbn_list) - 1:
-                time.sleep(3 + 2 * (i % 3) / 2.0)
+        def generate():
+            total = len(isbn_list)
+            yield json.dumps({"type": "start", "total": total}, ensure_ascii=False) + "\n"
 
-        success_count = sum(1 for r in results if r.get("success"))
+            results = []
+            for i, isbn_raw in enumerate(isbn_list):
+                yield json.dumps({
+                    "type": "progress",
+                    "current": i + 1,
+                    "total": total,
+                    "isbn": isbn_raw,
+                    "message": f"正在查询第 {i + 1}/{total} 条: {isbn_raw}"
+                }, ensure_ascii=False) + "\n"
 
-        return jsonify({
-            "success": True,
-            "total": len(isbn_list),
-            "success_count": success_count,
-            "fail_count": len(isbn_list) - success_count,
-            "results": results
-        })
+                result = _do_query(isbn_raw)
+                results.append(result)
+
+                if i < len(isbn_list) - 1:
+                    yield json.dumps({
+                        "type": "wait",
+                        "current": i + 1,
+                        "total": total,
+                        "message": f"已完成 {i + 1}/{total} 条，为防反爬机制封禁，正在安全等待中..."
+                    }, ensure_ascii=False) + "\n"
+                    time.sleep(3 + 2 * (i % 3) / 2.0)
+
+            success_count = sum(1 for r in results if r.get("success"))
+            yield json.dumps({
+                "type": "done",
+                "success": True,
+                "total": total,
+                "success_count": success_count,
+                "fail_count": total - success_count,
+                "results": results
+            }, ensure_ascii=False) + "\n"
+
+        response = Response(stream_with_context(generate()), mimetype='application/x-ndjson')
+        response.headers['X-Accel-Buffering'] = 'no'
+        response.headers['Cache-Control'] = 'no-cache'
+        return response
 
     except Exception as e:
         traceback.print_exc()
@@ -186,11 +208,14 @@ def api_export():
         df.to_excel(writer, index=False, sheet_name='查询结果')
     output.seek(0)
 
+    # 生成时间戳
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+
     return send_file(
         output,
         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         as_attachment=True,
-        download_name='中图分类号查询结果.xlsx'
+        download_name=f'中图分类号查询结果_{timestamp}.xlsx'
     )
 
 
@@ -213,12 +238,12 @@ def _parse_upload_file(file):
     elif filename.endswith('.csv'):
         # CSV 文件：尝试读取第一列或名为 isbn 的列
         content = file.read().decode('utf-8', errors='ignore')
-        df = pd.read_csv(io.StringIO(content))
+        df = pd.read_csv(io.StringIO(content), dtype=str)
         isbn_list = _extract_isbn_from_df(df)
 
     elif filename.endswith(('.xlsx', '.xls')):
         # Excel 文件
-        df = pd.read_excel(file, engine='openpyxl')
+        df = pd.read_excel(file, engine='openpyxl', dtype=str)
         isbn_list = _extract_isbn_from_df(df)
 
     return isbn_list
@@ -228,23 +253,34 @@ def _extract_isbn_from_df(df):
     """从 DataFrame 中提取 ISBN 列"""
     isbn_list = []
 
-    # 先找名为 isbn 的列（不区分大小写）
+    # 先找包含 isbn 或条码的列（不区分大小写）
     isbn_col = None
     for col in df.columns:
-        if str(col).strip().upper() == 'ISBN':
+        col_up = str(col).strip().upper()
+        if 'ISBN' in col_up or '条码' in col_up:
             isbn_col = col
             break
 
     if isbn_col is not None:
         isbn_list = [str(v).strip() for v in df[isbn_col].dropna().tolist()]
     elif len(df.columns) > 0:
-        # 没有 isbn 列，取第一列
-        isbn_list = [str(v).strip() for v in df.iloc[:, 0].dropna().tolist()]
+        # 没有明确列名，取第一列
+        first_col_name = str(df.columns[0]).strip()
+        isbn_list = []
+        if not first_col_name.startswith('Unnamed:'):
+            isbn_list.append(first_col_name)
+        isbn_list.extend([str(v).strip() for v in df.iloc[:, 0].dropna().tolist()])
 
-    # 过滤空值和表头
-    isbn_list = [isbn for isbn in isbn_list if isbn and isbn.lower() != 'isbn' and isbn != 'nan']
+    # 过滤空值和表头，同时去掉由 pandas dtype 隐式转换浮点数带来的 .0
+    cleaned_list = []
+    for isbn in isbn_list:
+        if not isbn or isbn.lower() == 'isbn' or isbn.lower() == 'nan':
+            continue
+        if isbn.endswith('.0'):
+            isbn = isbn[:-2]
+        cleaned_list.append(isbn)
 
-    return isbn_list
+    return cleaned_list
 
 
 if __name__ == '__main__':

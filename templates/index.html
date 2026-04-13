@@ -133,6 +133,17 @@
                 <input type="file" id="file-input" accept=".csv,.xlsx,.xls,.txt" hidden>
             </div>
 
+            <div style="text-align: center; margin-top: 1rem; margin-bottom: 0.5rem;">
+                <a href="{{ url_for('static', filename='批量查询模板.xlsx') }}" download class="template-link" style="color: var(--primary-color, #3b82f6); text-decoration: none; font-size: 0.95rem; display: inline-flex; align-items: center; justify-content: center; transition: opacity 0.2s;" onmouseover="this.style.opacity=0.8" onmouseout="this.style.opacity=1">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 6px;">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                        <polyline points="7 10 12 15 17 10"/>
+                        <line x1="12" y1="15" x2="12" y2="3"/>
+                    </svg>
+                    下载批量查询模板（Excel 格式）
+                </a>
+            </div>
+
             <!-- 上传的文件信息 -->
             <div class="file-info hidden" id="file-info">
                 <div class="file-detail">

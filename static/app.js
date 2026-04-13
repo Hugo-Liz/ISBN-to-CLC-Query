@@ -202,7 +202,7 @@ function doBatchQuery() {
     // 显示进度条
     showElement('batch-progress');
     document.getElementById('progress-fill').style.width = '0%';
-    document.getElementById('progress-text').textContent = '正在上传文件并查询...';
+    document.getElementById('progress-text').textContent = '正在上传文件并请求服务器...';
 
     // 禁用按钮
     const btn = document.getElementById('btn-batch-query');
@@ -211,41 +211,65 @@ function doBatchQuery() {
     const formData = new FormData();
     formData.append('file', currentFile);
 
-    // 模拟进度动画（因为请求是整体返回的）
-    let progress = 0;
-    const progressInterval = setInterval(() => {
-        if (progress < 90) {
-            progress += Math.random() * 5;
-            document.getElementById('progress-fill').style.width = `${Math.min(progress, 90)}%`;
-        }
-    }, 500);
-
     fetch('/api/batch', {
         method: 'POST',
         body: formData
     })
-    .then(res => res.json())
-    .then(data => {
-        clearInterval(progressInterval);
-        document.getElementById('progress-fill').style.width = '100%';
-        document.getElementById('progress-text').textContent = '查询完成';
-        btn.disabled = false;
+    .then(async res => {
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.error || '批量查询失败');
+        }
 
-        setTimeout(() => {
-            hideElement('batch-progress');
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
 
-            if (data.success) {
-                showBatchResults(data);
-            } else {
-                showBatchError(data.error || '批量查询失败');
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            let lines = buffer.split('\n');
+            buffer = lines.pop(); // 将未完整的一行留到下次处理
+
+            for (let line of lines) {
+                if (!line.trim()) continue;
+                try {
+                    const data = JSON.parse(line);
+
+                    if (data.type === 'start') {
+                        document.getElementById('progress-text').textContent = `解析成功，即将开始查询共 ${data.total} 条记录...`;
+                    } else if (data.type === 'progress' || data.type === 'wait') {
+                        let pct = 0;
+                        if (data.type === 'progress') {
+                            pct = Math.round(((data.current - 1) / data.total) * 100);
+                        } else {
+                            pct = Math.round((data.current / data.total) * 100);
+                        }
+                        
+                        document.getElementById('progress-fill').style.width = `${pct}%`;
+                        document.getElementById('progress-text').textContent = data.message;
+                    } else if (data.type === 'done') {
+                        document.getElementById('progress-fill').style.width = '100%';
+                        document.getElementById('progress-text').textContent = '所有记录查询完毕！整理表格中...';
+                        btn.disabled = false;
+                        
+                        setTimeout(() => {
+                            hideElement('batch-progress');
+                            showBatchResults(data);
+                        }, 500);
+                    }
+                } catch(e) {
+                    console.error('Failed to parse stream line:', line, e);
+                }
             }
-        }, 500);
+        }
     })
     .catch(err => {
-        clearInterval(progressInterval);
         hideElement('batch-progress');
         btn.disabled = false;
-        showBatchError('网络请求失败，请检查网络连接');
+        showBatchError(err.message || '网络请求或数据流解析失败，请检查网络');
         console.error('批量查询出错:', err);
     });
 }
@@ -308,11 +332,20 @@ function exportResults() {
         return res.blob();
     })
     .then(blob => {
+        // 生成时间戳
+        const now = new Date();
+        const timestamp = now.getFullYear() +
+                          String(now.getMonth() + 1).padStart(2, '0') +
+                          String(now.getDate()).padStart(2, '0') + '_' +
+                          String(now.getHours()).padStart(2, '0') +
+                          String(now.getMinutes()).padStart(2, '0') +
+                          String(now.getSeconds()).padStart(2, '0');
+        
         // 创建下载链接
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = '中图分类号查询结果.xlsx';
+        a.download = `中图分类号查询结果_${timestamp}.xlsx`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
