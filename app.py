@@ -5,12 +5,13 @@ import os
 import io
 import time
 import json
+import random
 import traceback
 from flask import Flask, render_template, request, jsonify, send_file, Response, stream_with_context
 import pandas as pd
 
 from isbn_utils import validate_isbn
-from nlc_query import query_isbn
+from nlc_query import NLCClient, query_isbn
 from clc_parser import parse_clc
 
 app = Flask(__name__)
@@ -30,7 +31,10 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def _do_query(isbn_raw):
+MAX_CONSECUTIVE_UPSTREAM_FAILURES = 3
+
+
+def _do_query(isbn_raw, client=None):
     """
     执行单条 ISBN 查询的核心逻辑。
     返回结果字典。
@@ -38,16 +42,22 @@ def _do_query(isbn_raw):
     # 验证 ISBN
     isbn, error = validate_isbn(isbn_raw)
     if error:
-        return {"success": False, "error": error, "isbn_input": isbn_raw}
+        return {
+            "success": False,
+            "error": error,
+            "isbn_input": isbn_raw,
+            "error_type": "validation",
+        }
 
     try:
         # 查询国图
-        book_data = query_isbn(isbn)
+        book_data = query_isbn(isbn, client=client)
         if not book_data:
             return {
                 "success": False,
                 "error": f"国家图书馆未收录此 ISBN: {isbn}",
-                "isbn_input": isbn_raw
+                "isbn_input": isbn_raw,
+                "error_type": "not_found",
             }
 
         # 解析中图分类号
@@ -71,10 +81,102 @@ def _do_query(isbn_raw):
         }
 
     except (TimeoutError, ConnectionError) as e:
-        return {"success": False, "error": str(e), "isbn_input": isbn_raw}
+        return {
+            "success": False,
+            "error": str(e),
+            "isbn_input": isbn_raw,
+            "error_type": "upstream",
+        }
     except Exception as e:
         traceback.print_exc()
-        return {"success": False, "error": f"查询出错: {str(e)}", "isbn_input": isbn_raw}
+        return {
+            "success": False,
+            "error": f"查询出错: {str(e)}",
+            "isbn_input": isbn_raw,
+            "error_type": "internal",
+        }
+
+
+def _generate_batch_results(isbn_list, client=None, sleep_fn=time.sleep, delay_fn=None):
+    """逐行生成批量查询结果，并在本批次内复用会话与 ISBN 结果。"""
+    owns_client = client is None
+    client = client or NLCClient()
+    delay_fn = delay_fn or (lambda: random.uniform(2.0, 4.0))
+
+    total = len(isbn_list)
+    results = []
+    batch_cache = {}
+    consecutive_upstream_failures = 0
+    circuit_open = False
+
+    try:
+        yield json.dumps({"type": "start", "total": total}, ensure_ascii=False) + "\n"
+
+        for i, isbn_raw in enumerate(isbn_list):
+            yield json.dumps({
+                "type": "progress",
+                "current": i + 1,
+                "total": total,
+                "isbn": isbn_raw,
+                "message": f"正在查询第 {i + 1}/{total} 条: {isbn_raw}"
+            }, ensure_ascii=False) + "\n"
+
+            normalized_isbn, validation_error = validate_isbn(isbn_raw)
+            client.last_network_request = False
+            reused_batch_result = False
+
+            if normalized_isbn and normalized_isbn in batch_cache:
+                result = dict(batch_cache[normalized_isbn])
+                result["isbn_input"] = isbn_raw
+                reused_batch_result = True
+            elif circuit_open and normalized_isbn and not validation_error:
+                result = {
+                    "success": False,
+                    "error": "国家图书馆连续请求失败，本批次已暂停后续网络查询，请稍后重试",
+                    "isbn_input": isbn_raw,
+                    "error_type": "circuit_open",
+                }
+            else:
+                result = _do_query(isbn_raw, client=client)
+                if normalized_isbn:
+                    batch_cache[normalized_isbn] = dict(result)
+
+            results.append(result)
+
+            # 熔断只观察真实网络请求，缓存、重复项和输入错误均不参与计数。
+            if client.last_network_request and not reused_batch_result:
+                if result.get("error_type") == "upstream":
+                    consecutive_upstream_failures += 1
+                    if consecutive_upstream_failures >= MAX_CONSECUTIVE_UPSTREAM_FAILURES:
+                        circuit_open = True
+                else:
+                    consecutive_upstream_failures = 0
+
+            if client.last_network_request and i < total - 1 and not circuit_open:
+                delay = delay_fn()
+                yield json.dumps({
+                    "type": "wait",
+                    "current": i + 1,
+                    "total": total,
+                    "message": (
+                        f"已完成 {i + 1}/{total} 条，等待 {delay:.1f} 秒后继续，"
+                        "以降低访问频率..."
+                    )
+                }, ensure_ascii=False) + "\n"
+                sleep_fn(delay)
+
+        success_count = sum(1 for result in results if result.get("success"))
+        yield json.dumps({
+            "type": "done",
+            "success": True,
+            "total": total,
+            "success_count": success_count,
+            "fail_count": total - success_count,
+            "results": results
+        }, ensure_ascii=False) + "\n"
+    finally:
+        if owns_client:
+            client.close()
 
 
 @app.route('/')
@@ -127,43 +229,10 @@ def api_batch():
                 "error": f"单次最多查询 30 条，当前文件包含 {len(isbn_list)} 条"
             }), 400
 
-        def generate():
-            total = len(isbn_list)
-            yield json.dumps({"type": "start", "total": total}, ensure_ascii=False) + "\n"
-
-            results = []
-            for i, isbn_raw in enumerate(isbn_list):
-                yield json.dumps({
-                    "type": "progress",
-                    "current": i + 1,
-                    "total": total,
-                    "isbn": isbn_raw,
-                    "message": f"正在查询第 {i + 1}/{total} 条: {isbn_raw}"
-                }, ensure_ascii=False) + "\n"
-
-                result = _do_query(isbn_raw)
-                results.append(result)
-
-                if i < len(isbn_list) - 1:
-                    yield json.dumps({
-                        "type": "wait",
-                        "current": i + 1,
-                        "total": total,
-                        "message": f"已完成 {i + 1}/{total} 条，为防反爬机制封禁，正在安全等待中..."
-                    }, ensure_ascii=False) + "\n"
-                    time.sleep(3 + 2 * (i % 3) / 2.0)
-
-            success_count = sum(1 for r in results if r.get("success"))
-            yield json.dumps({
-                "type": "done",
-                "success": True,
-                "total": total,
-                "success_count": success_count,
-                "fail_count": total - success_count,
-                "results": results
-            }, ensure_ascii=False) + "\n"
-
-        response = Response(stream_with_context(generate()), mimetype='application/x-ndjson')
+        response = Response(
+            stream_with_context(_generate_batch_results(isbn_list)),
+            mimetype='application/x-ndjson',
+        )
         response.headers['X-Accel-Buffering'] = 'no'
         response.headers['Cache-Control'] = 'no-cache'
         return response
