@@ -1,176 +1,139 @@
-# ISBN 查询中图分类号 Web 工具
+# 当前实现说明
 
-## 背景
+本文记录项目当前已经落地的技术方案及后续边界。它以代码现状为准，不再作为尚未执行的初始开发计划。
 
-通过 ISBN 号关联查询中图分类号（CLC），并将分类号解析为完整的中文层级分类路径。工具形态为 Web 应用，使用 Python Flask 后端 + 前端页面实现。
-
-## 核心技术方案
-
-### 数据流
+## 数据流
 
 ```mermaid
-graph LR
-    A[用户输入 ISBN] --> B[Flask 后端]
-    B --> C[请求国家图书馆 OPAC]
-    C --> D[解析 HTML 提取中图分类号]
-    D --> E[chinese-library-classification 库解析层级]
-    E --> F[返回结果给前端展示]
+flowchart LR
+    A[ISBN 输入] --> B[格式校验与 ISBN-13 标准化]
+    B --> C{SQLite 缓存}
+    C -->|命中| G[解析中图分类路径]
+    C -->|未命中| D[国家图书馆 OPAC]
+    D --> E[解析书目 HTML]
+    E --> F[写入成功或未收录缓存]
+    F --> G
+    G --> H[页面展示或 Excel 导出]
 ```
 
-### 1. ISBN → 中图分类号（数据源：国家图书馆 OPAC）
+## 模块职责
 
-参考 [NLCISBNPlugin](https://github.com/DoiiarX/NLCISBNPlugin) 和 [EbookDataGeter](https://github.com/Hellohistory/EbookDataGeter) 的成熟实现，核心步骤：
+### `isbn_utils.py`
 
-1. **获取动态 URL**：先访问 `http://opac.nlc.cn/F`，从响应中提取带会话 ID 的动态 URL
-2. **发起 ISBN 检索**：向动态 URL 发送查询请求，参数 `func=find-b, find_code=ISB, request={isbn}`
-3. **解析 HTML 结果**：从返回的 HTML 表格（`table#td`）中提取 `中图分类号` 字段
+- 清理 ISBN 中的空格、连字符等非有效字符。
+- 校验 ISBN-10 和 ISBN-13 校验位。
+- 将有效 ISBN-10 转换成 ISBN-13。
 
-### 2. 中图分类号 → 中文分类层级
+### `nlc_query.py`
 
-使用现成的 Python 库 `chinese-library-classification`：
-- `pip install chinese-library-classification`
-- 通过 `num2info(code)` 获取分类信息（名称、层级、上下级关系）
-- 通过 `num2upper(code)` 获取所有上级分类，构建完整路径
+`NLCClient` 负责一次单条或批量任务中的国图通信：
 
-> [!IMPORTANT]
-> 该库的数据覆盖度需要实际验证。如果覆盖不足，备选方案是内置一份中图分类号字典（22个一级大类 + 常用二三级分类），自行实现解析。
+- 使用稳定且精简的请求头。
+- 禁止继承终端代理环境变量。
+- 复用 `requests.Session`、连接池和国图动态会话 URL。
+- 对连接错误、读取错误、429 和部分 5xx 响应最多重试 2 次。
+- 使用退避策略并遵守 `Retry-After`。
+- 验证动态地址必须属于 `opac.nlc.cn`，防止使用站外 URL。
+- 兼容绝对地址、相对地址和端口变化。
+- 查询页无法识别时刷新动态会话并额外尝试一次。
+- 区分超时、连接失败、访问限制和响应结构异常。
 
----
+`query_isbn()` 保留简洁的单条调用接口；批量任务向其传入共享的 `NLCClient`。
 
-## 功能需求
+### `query_cache.py`
 
-| 功能 | 说明 |
-|------|------|
-| 单条查询 | 输入单个 ISBN，展示书名、中图分类号、完整分类路径等 |
-| 批量查询 | 上传 CSV/Excel/TXT 文件（含 ISBN 列），批量查询 |
-| 结果导出 | 将批量查询结果导出为 CSV/Excel 文件 |
-| ISBN 校验 | 支持 ISBN-10 和 ISBN-13，自动转换和校验 |
-| 错误处理 | 查询失败时给出明确提示（ISBN无效、国图无数据、网络超时等） |
+SQLite 表 `isbn_query_cache` 以标准 ISBN-13 为主键，保存：
 
----
+- `success`：完整书目查询结果，默认有效期 90 天。
+- `not_found`：国图未收录，默认有效期 24 小时。
 
-## 项目文件结构
+每次操作独立建立短连接，并设置 5 秒忙等待，避免 Flask 请求之间长期共享 SQLite 连接。数据库路径可由 `ISBN_CLC_CACHE_PATH` 覆盖。
 
-```
-Query_of_Chinese_Library_Classification_Number/
-├── app.py                  # Flask 应用主入口
-├── requirements.txt        # Python 依赖
-├── nlc_query.py            # 国家图书馆 OPAC 查询模块
-├── clc_parser.py           # 中图分类号解析模块
-├── isbn_utils.py           # ISBN 校验与转换工具
-├── static/
-│   ├── style.css           # 前端样式
-│   └── app.js              # 前端交互逻辑
-├── templates/
-│   └── index.html          # 主页面模板
-├── uploads/                # 上传文件临时目录（运行时创建）
-└── GEMINI.md               # 已有的规则文件
-```
+### `clc_parser.py`
 
----
+- 优先查找分类号的精确类目。
+- 精确类目不存在时，从末尾逐位截短，返回能找到的最细类目。
+- 第三方分类数据完全无法匹配时，使用 22 个一级大类字典兜底。
 
-## 各模块详细设计
+当前算法不支持完整的复分、仿分和组合分类号。该问题已经确认，但规则设计将另行讨论，本次稳定性版本不修改这个模块。
 
-### 1. `isbn_utils.py` — ISBN 校验工具
+### `app.py`
 
-- `canonical(isbn)`: 标准化 ISBN，去除多余字符
-- `is_isbn10(isbn)` / `is_isbn13(isbn)`: 校验有效性
-- `to_isbn13(isbn10)`: ISBN-10 转 ISBN-13
-- 参考 NLCISBNPlugin 中已有的成熟实现
+#### 单条查询
 
-### 2. `nlc_query.py` — 国图 OPAC 查询模块
+1. 校验并标准化 ISBN。
+2. 通过独立 `NLCClient` 查询缓存或国图。
+3. 调用 `parse_clc()` 解析分类路径。
+4. 返回结构化 JSON。
 
-- `get_session()`: 创建 requests.Session，获取动态 URL
-- `query_isbn(isbn)`: 通过 ISBN 查询国图，返回原始元数据字典
-- 包含随机 User-Agent、请求间隔等反反爬策略
-- 返回数据结构：
-```python
-{
-    "title": "书名",
-    "authors": "作者",
-    "publisher": "出版社",
-    "pubdate": "出版年",
-    "clc_code": "TP311.12",  # 中图分类号
-    "isbn": "9787111544937"
-}
-```
+#### 批量查询
 
-### 3. `clc_parser.py` — 中图分类号解析模块
+1. 从 CSV、XLSX 或 TXT 提取 ISBN，最多 30 条；旧式二进制 XLS 需先转换为 XLSX。
+2. 整个批次共享一个 `NLCClient`。
+3. 使用标准 ISBN-13 作为批次内去重键。
+4. 重复项复用首次结果，但保留每一条输入记录。
+5. 仅真实网络请求后随机等待 2～4 秒。
+6. 只根据真实上游请求更新连续失败计数。
+7. 连续 3 次上游失败后打开本批次熔断器。
+8. 使用 NDJSON 依次输出 `start`、`progress`、`wait` 和 `done` 事件。
 
-- `parse_clc(code)`: 输入分类号，输出完整层级路径
-- 优先使用 `chinese-library-classification` 库
-- 如果库查不到，回退到内置的一级大类字典
-- 返回数据结构：
-```python
-{
-    "code": "TP311.12",
-    "name": "数据结构",
-    "path": ["工业技术", "自动化技术、计算机技术", "计算技术、计算机技术", "程序设计、软件工程", "数据结构"],
-    "path_str": "工业技术 > 自动化技术、计算机技术 > ... > 数据结构"
-}
+#### 导出
+
+前端把已完成的结果提交到 `/api/export`，后端使用 Pandas 和 Openpyxl 生成带时间戳的 Excel 文件。
+
+## 错误类型
+
+批量内部结果使用 `error_type` 区分主要失败原因：
+
+| 类型 | 含义 |
+|---|---|
+| `validation` | ISBN 格式或校验位错误 |
+| `not_found` | 国图未收录 |
+| `upstream` | 国图超时、拒绝或连接失败 |
+| `circuit_open` | 连续上游失败后暂停本批次后续网络查询 |
+| `internal` | 未预期的内部错误 |
+
+## 自动测试
+
+测试使用 Python 标准库 `unittest`，不依赖真实国图网络：
+
+```bash
+python -m unittest discover -s tests -v
 ```
 
-### 4. `app.py` — Flask 主应用
+| 测试文件 | 覆盖内容 |
+|---|---|
+| `tests/test_query_cache.py` | 成功缓存、未收录缓存、TTL 过期 |
+| `tests/test_nlc_query.py` | 动态 URL、会话复用、缓存命中、会话刷新 |
+| `tests/test_app_batch.py` | 批量去重、结果行保留、连续失败熔断 |
 
-**API 路由：**
+当前共 9 项测试。
 
-| 路由 | 方法 | 功能 |
-|------|------|------|
-| `/` | GET | 渲染主页面 |
-| `/api/query` | POST | 单条 ISBN 查询 |
-| `/api/batch` | POST | 批量查询（接收上传文件） |
-| `/api/export` | POST | 导出查询结果为 CSV/Excel |
+## 运行时文件
 
-### 5. 前端页面（`index.html` + `style.css` + `app.js`）
+以下内容不会提交到 Git：
 
-- **设计风格**：现代深色主题，毛玻璃效果，渐变色调
-- **单条查询区**：ISBN 输入框 + 查询按钮，结果卡片式展示
-- **批量查询区**：文件拖拽上传 + 结果表格展示 + 导出按钮
-- **响应式布局**：适配桌面和移动端
+- `.venv/`：本地 Python 虚拟环境。
+- `data/`：SQLite 查询缓存。
+- `uploads/`：Flask 运行时上传目录。
+- `__pycache__/`：Python 字节码缓存。
 
----
+## 已确认但延期的工作
 
-## 依赖清单 (`requirements.txt`)
+### 组合分类路径解析
 
-```
-flask
-requests
-beautifulsoup4
-chinese-library-classification
-openpyxl
-pandas
-```
+已知示例：
 
-> [!NOTE]
-> - `openpyxl` 用于读写 Excel 文件
-> - `pandas` 用于处理批量数据和导出
+- `I524.45`：当前只能匹配到“文学”。
+- `K835.635.72=43`：当前只能匹配到“历史、地理”。
 
----
+后续方案需要统一处理范围类目、地区复分、仿分、国际时代表以及 `-`、`=`、`()`、`/` 等标记。为避免针对单个分类号硬编码，应该在规则和数据来源确认后单独实现通用组合解析器。
 
-## User Review Required
+## 发布流程
 
-> [!WARNING]
-> **关于国家图书馆 OPAC 的稳定性**：国图 OPAC 不是公开 API，存在以下风险：
-> 1. 高频请求可能导致 IP 被封
-> 2. 页面结构变化可能导致解析失败
-> 3. 批量查询时需要控制请求频率（建议每次请求间隔 1-2 秒）
->
-> 对于批量查询，会加入请求间隔控制，并在前端展示查询进度。
+项目采用功能分支和 Pull Request：
 
-> [!IMPORTANT]
-> **`chinese-library-classification` 库的数据覆盖度**尚未验证。开发时会先测试该库，如果覆盖不足，将内置一份完整的分类号字典作为补充方案。
-
----
-
-## 验证计划
-
-### 自动测试
-- 使用已知 ISBN 测试单条查询（如 `9787111544937` → 深入理解计算机系统）
-- 准备测试文件验证批量上传和导出功能
-- 验证 ISBN-10 和 ISBN-13 的校验与转换
-
-### 手动验证
-- 启动 Flask 开发服务器，在浏览器中完整测试查询流程
-- 验证文件上传（CSV、Excel、TXT 格式）
-- 验证导出文件的内容正确性
-- 检查前端在不同窗口尺寸下的响应式表现
+1. 在 `codex/` 前缀分支完成修改。
+2. 运行自动测试和 `git diff --check`。
+3. 推送分支并创建面向 `main` 的 Pull Request。
+4. 审核通过后合并，并同步本地 `main`。
