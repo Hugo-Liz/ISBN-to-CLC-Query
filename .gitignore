@@ -17,6 +17,9 @@ env/
 # Flask specific / uploads
 uploads/
 
+# Runtime query cache
+data/
+
 # IDE files
 .vscode/
 .idea/
