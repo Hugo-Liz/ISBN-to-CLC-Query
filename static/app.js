@@ -77,6 +77,8 @@ function showSingleResult(data) {
     document.getElementById('result-publisher').textContent = data.publisher || '-';
     document.getElementById('result-pubdate').textContent = data.pubdate || '-';
     document.getElementById('result-clc-code').textContent = data.clc_code || '-';
+    document.getElementById('result-clc-status').textContent = clcStatusText(data);
+    document.getElementById('result-clc-detail').textContent = clcExplanationText(data);
 
     // 构建分类路径 DOM
     const pathContainer = document.getElementById('result-clc-path');
@@ -116,6 +118,29 @@ function showSingleResult(data) {
     }
 
     showElement('single-result');
+}
+
+// 单条、批量共用状态与说明，不把查询成功误当作路径完整。
+function clcStatusText(data) {
+    const labels = [data.clc_status_label || '未提供解析状态'];
+    if (data.clc_code_status && data.clc_code_status !== 'not_assessed') {
+        labels.push(data.clc_code_status_label);
+    }
+    if (data.clc_unparsed) labels.push(`未解析：${data.clc_unparsed}`);
+    return labels.join(' · ');
+}
+
+function clcExplanationText(data) {
+    const lines = [];
+    if (data.clc_explanation) lines.push(data.clc_explanation);
+    if (data.clc_warnings) lines.push(...data.clc_warnings);
+    lines.push('分类路径是对号码的解释，不等于对编目有效性的鉴定。原始中图分类号保持不变。');
+    const detail = data.clc_parse || {};
+    (detail.sources || []).filter(source => source.kind === 'rule').forEach(source => {
+        lines.push(`${source.rule_id}：第五版 PDF 第 ${source.pdf_pages.join('、')} 页`);
+    });
+    if (detail.rules_version) lines.push(`规则版本：${detail.rules_version}（全书规则仍在分阶段核对）`);
+    return lines.join('\n');
 }
 
 function showSingleError(message) {
@@ -298,6 +323,10 @@ function showBatchResults(data) {
             <td>${escapeHtml(r.title || '-')}</td>
             <td class="cell-clc">${escapeHtml(r.clc_code || '-')}</td>
             <td class="cell-path">${escapeHtml(r.clc_path_str || '-')}</td>
+            <td class="cell-path">
+                ${r.success ? escapeHtml(clcStatusText(r)) : '-'}
+                ${r.success ? `<details class="parse-details"><summary>解析说明</summary><div class="parse-explanation">${escapeHtml(clcExplanationText(r))}</div></details>` : ''}
+            </td>
             <td class="cell-path">${escapeHtml(r.subject || '-')}</td>
             <td class="${r.success ? 'status-success' : 'status-fail'}">
                 ${r.success ? '✓ 成功' : '✗ ' + escapeHtml(r.error || '失败')}

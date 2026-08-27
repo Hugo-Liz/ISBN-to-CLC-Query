@@ -1,6 +1,6 @@
 flask
 requests
 beautifulsoup4
-chinese-library-classification
+chinese-library-classification==0.0.1
 openpyxl
 pandas
