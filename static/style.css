@@ -404,6 +404,29 @@ body {
     border: 1px solid var(--border);
 }
 
+.parse-status {
+    margin: 12px 0 8px;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    overflow-wrap: anywhere;
+}
+
+.parse-details {
+    margin-top: 8px;
+    font-size: 0.85rem;
+}
+
+.parse-details summary {
+    cursor: pointer;
+}
+
+.parse-explanation {
+    padding-top: 8px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.65;
+}
+
 .clc-path-section label {
     font-size: 0.75rem;
     color: var(--text-muted);

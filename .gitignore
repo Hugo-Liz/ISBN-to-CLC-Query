@@ -13,12 +13,34 @@ env/
 
 # Environment variables
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Flask specific / uploads
 uploads/
 
 # Runtime query cache
 data/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+
+# Local research, source documents, logs and agent state (never publish)
+private/
+tmp/
+output/
+logs/
+*.log
+*.har
+*.pdf
+.agents/
+.codex/
 
 # IDE files
 .vscode/

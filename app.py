@@ -76,6 +76,14 @@ def _do_query(isbn_raw, client=None):
             "clc_name": clc_info.get("name", ""),
             "clc_path": clc_info.get("path", []),
             "clc_path_str": clc_info.get("path_str", ""),
+            "clc_status": clc_info["status"],
+            "clc_status_label": clc_info["status_label"],
+            "clc_code_status": clc_info["code_status"],
+            "clc_code_status_label": clc_info["code_status_label"],
+            "clc_unparsed": clc_info["unparsed"],
+            "clc_explanation": "；".join(clc_info["explanations"]),
+            "clc_warnings": clc_info["warnings"],
+            "clc_parse": clc_info,
             "subject": book_data.get("subject", ""),
             "summary": book_data.get("summary", ""),
         }
@@ -263,7 +271,14 @@ def api_export():
             "出版年": r.get("pubdate", ""),
             "中图分类号": r.get("clc_code", ""),
             "分类名称": r.get("clc_name", ""),
-            "完整分类路径": r.get("clc_path_str", ""),
+            "分类路径": r.get("clc_path_str", ""),
+            "解析状态": r.get("clc_status_label", ""),
+            "号码状态": r.get("clc_code_status_label", ""),
+            "复分说明": r.get("clc_explanation", ""),
+            "未解析部分": r.get("clc_unparsed", ""),
+            "解析提示": "；".join(r.get("clc_warnings", [])),
+            "规则版本": r.get("clc_parse", {}).get("rules_version", ""),
+            "规则编号": "；".join(r.get("clc_parse", {}).get("rule_ids", [])),
             "主题": r.get("subject", ""),
             "查询状态": "成功" if r.get("success") else "失败",
             "错误信息": r.get("error", ""),
@@ -275,6 +290,11 @@ def api_export():
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='查询结果')
+        # 未解析尾缀可能以=开头。书目和分类字符串必须作为文字，不能成为Excel公式。
+        for row in writer.sheets['查询结果'].iter_rows():
+            for cell in row:
+                if cell.data_type == 'f':
+                    cell.data_type = 's'
     output.seek(0)
 
     # 生成时间戳
