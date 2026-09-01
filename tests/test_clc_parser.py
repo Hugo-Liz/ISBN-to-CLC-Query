@@ -2,27 +2,41 @@ import copy
 import json
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from importlib import resources
 from unittest.mock import patch
 
-from chinese_library_classification.utils import recurse_upper
-
 from clc_parser import parse_clc
-from clc_rules.base import BaseIndex, get_base
+from clc_rules.base import BaseIndex, get_base, load_overlay
 from clc_rules.engine import RuleParser, compact, get_registry
 
 
 class BaseCompatibilityTest(unittest.TestCase):
-    def test_every_original_parent_chain_is_preserved(self):
+    def test_dependency_fallback_and_official_overlay_are_merged(self):
         base = get_base()
-        self.assertEqual(len(base.records), 45785)
-        checked = 0
+        package = resources.files("chinese_library_classification")
+        with package.joinpath("data", "data.json").open(encoding="utf-8") as stream:
+            original = json.load(stream)
+        overlay = load_overlay()
+        superseded = set(overlay["superseded_dependency_codes"])
+        expected_count = len(original) - len(superseded) + overlay["statistics"]["added_records"]
+        self.assertEqual(len(base.records), expected_count)
+        for code in original.keys() - base.official_codes - superseded:
+            self.assertEqual(base.records[code]["name"], original[code]["name"], code)
+            self.assertEqual(base.records[code]["up_level"], original[code]["up_level"], code)
+        for code, official in overlay["records"].items():
+            self.assertEqual(base.records[code]["name"], official["name"], code)
+            self.assertEqual(base.records[code]["up_level"], official["up_level"], code)
+        self.assertTrue(superseded.isdisjoint(base.records))
+
+    def test_every_merged_parent_chain_and_child_link_is_valid(self):
+        base = get_base()
         for code, row in base.records.items():
             with self.subTest(code=code):
-                original = list(reversed(recurse_upper(base.records, code, upper=[])))
-                expected = [name for _number, name in original] + [row["name"]]
-                self.assertEqual([node["name"] for node in base.path(code)], expected)
-                checked += 1
-        self.assertEqual(checked, len(base.records))
+                path = base.path(code)
+                self.assertEqual(path[-1]["name"], row["name"])
+                self.assertEqual(len(path), row["level"])
+                if row["up_level"] is not None:
+                    self.assertIn(code, base.records[row["up_level"]]["next_level"])
 
     def test_exact_matches_keep_original_names_and_paths(self):
         base = get_base()
@@ -44,7 +58,17 @@ class BaseCompatibilityTest(unittest.TestCase):
             self.assertEqual(result["path"], [node["name"] for node in base.path(code)], code)
             self.assertTrue(result["complete"], code)
             named += 1
-        self.assertEqual((named, unnamed), (45757, 28))
+        self.assertEqual(named + unnamed, len(base.records))
+        self.assertEqual(unnamed, 28)
+
+    def test_fifth_edition_visible_nodes_override_stale_dependency_data(self):
+        result = parse_clc("K237.1")
+        self.assertIn("古代史中期（公元前475~公元581年）", result["path"])
+        self.assertNotIn("封建社会（公元前475~公元1840年）", result["path"])
+        self.assertTrue(any(source.get("kind") == "official_base_overlay" for source in result["sources"]))
+        self.assertFalse(get_base().contains("G07"))
+        self.assertTrue(get_base().contains("[G07]"))
+        self.assertFalse(get_base().contains("S50"))
 
     def test_dependency_loaded_once_and_results_not_shared(self):
         base = get_base()

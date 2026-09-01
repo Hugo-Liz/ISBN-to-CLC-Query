@@ -1,4 +1,4 @@
-"""可追溯的离线复分解析器：原库精确匹配优先，规则只补充已核对部分。"""
+"""可追溯的离线复分解析器：基础类目精确匹配优先，规则只补充已核对部分。"""
 
 import copy
 import json
@@ -14,7 +14,7 @@ from .base import get_base
 
 LOGGER = logging.getLogger(__name__)
 STATUS_LABELS = {
-    "exact": "原库精确匹配", "supplemented": "规则补全", "partial": "部分解析",
+    "exact": "基础类目精确匹配", "supplemented": "规则补全", "partial": "部分解析",
     "unknown": "未识别", "empty": "无分类号", "invalid": "格式异常", "unavailable": "解析服务异常",
 }
 VALIDITY_LABELS = {
@@ -552,6 +552,8 @@ class RuleParser:
         if self.registry_warning:
             result.warnings.append(self.registry_warning)
         sources = [{"kind": "dependency", "name": "chinese-library-classification", "version": self.base.version}]
+        if self.base.official_source and any(node.get("source") == "official_clc5" for node in result.nodes):
+            sources.append(dict(self.base.official_source))
         for rule_id in result.rules:
             sources.append({"kind": "rule", "rule_id": rule_id, "edition": 5, "pdf_pages": self.rules[rule_id]["pdf_pages"]})
         for table_id in result.tables:
